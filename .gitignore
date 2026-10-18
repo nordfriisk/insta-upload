@@ -1,0 +1,9 @@
+.env
+posts.csv
+state.db
+state.lock
+*.log
+__pycache__/
+.pytest_cache/
+venv/
+.venv/
