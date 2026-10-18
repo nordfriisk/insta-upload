@@ -6,9 +6,9 @@ fälligen Einträge über die offizielle Instagram Graph API. Die Medien müssen
 öffentlich erreichbar sein (z. B. bei Infomaniak); die Graph API lädt sie selbst
 von dort. Welche Beiträge schon veröffentlicht wurden, steht in einer SQLite-DB.
 
-Gedacht für den Aufruf per Cron, z. B. alle 5 Minuten:
-
-    */5 * * * * cd /pfad/zu/insta-upload && ./venv/bin/python insta_upload.py run
+Gedacht für den regelmäßigen Aufruf, z. B. alle 5 Minuten per launchd (macOS)
+oder Cron. Bei jedem Lauf wird außerdem der Langzeit-Token automatisch verlängert,
+sobald er alt genug ist.
 """
 
 from __future__ import annotations
@@ -16,12 +16,14 @@ from __future__ import annotations
 import argparse
 import csv
 import fcntl
+import hashlib
 import os
+import re
 import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
@@ -42,6 +44,18 @@ CREATE TABLE IF NOT EXISTS publications (
     media_id     TEXT,
     last_error   TEXT,
     updated_at   TEXT NOT NULL
+);
+
+-- Aktueller Zugriffstoken. Wird automatisch verlängert und ersetzt den Token aus
+-- der .env, solange dort derselbe Ausgangstoken steht (seed_hash).
+CREATE TABLE IF NOT EXISTS token (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    access_token TEXT NOT NULL,
+    seed_hash    TEXT NOT NULL,
+    refreshed_at TEXT,                   -- NULL: noch nie verlängert
+    expires_at   TEXT,                   -- NULL: unbekannt
+    attempted_at TEXT,                   -- letzter Verlängerungsversuch
+    last_error   TEXT
 );
 """
 
@@ -70,11 +84,12 @@ class Config:
     schedule_file: Path
     state_db: Path
     timezone: ZoneInfo
-    graph_host: str = "https://graph.facebook.com"
+    graph_host: str = "https://graph.instagram.com"
     graph_version: str = "v24.0"
     max_attempts: int = 3
     poll_interval: float = 5.0
     poll_timeout: float = 300.0
+    token_refresh_days: int = 7
 
     @classmethod
     def from_env(cls, base_dir: Path) -> "Config":
@@ -94,6 +109,7 @@ class Config:
             graph_host=os.environ.get("GRAPH_HOST", cls.graph_host).rstrip("/"),
             graph_version=os.environ.get("GRAPH_API_VERSION", cls.graph_version),
             max_attempts=int(os.environ.get("MAX_ATTEMPTS", cls.max_attempts)),
+            token_refresh_days=int(os.environ.get("TOKEN_REFRESH_DAYS", cls.token_refresh_days)),
         )
 
 
@@ -197,6 +213,7 @@ class State:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        path.chmod(0o600)  # enthält den Zugriffstoken
 
     def get(self, post_id: str) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM publications WHERE id = ?", (post_id,)).fetchone()
@@ -222,6 +239,35 @@ class State:
         cur = self.db.execute("DELETE FROM publications WHERE id = ? AND status != 'published'", (post_id,))
         self.db.commit()
         return cur.rowcount > 0
+
+    def token(self, env_token: str) -> sqlite3.Row:
+        """Liefert den gespeicherten Token; ein neuer Token in der .env ersetzt ihn."""
+        seed_hash = hashlib.sha256(env_token.encode()).hexdigest()
+        row = self.db.execute("SELECT * FROM token WHERE id = 1").fetchone()
+        if row is None or row["seed_hash"] != seed_hash:
+            self.db.execute(
+                "INSERT OR REPLACE INTO token (id, access_token, seed_hash) VALUES (1, ?, ?)",
+                (env_token, seed_hash),
+            )
+            self.db.commit()
+            row = self.db.execute("SELECT * FROM token WHERE id = 1").fetchone()
+        return row
+
+    def save_token(self, access_token: str, expires_at: datetime) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.db.execute(
+            """
+            UPDATE token SET access_token = ?, refreshed_at = ?, attempted_at = ?, expires_at = ?, last_error = NULL
+            WHERE id = 1
+            """,
+            (access_token, now, now, expires_at.isoformat(timespec="seconds")),
+        )
+        self.db.commit()
+
+    def token_error(self, error: str) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.db.execute("UPDATE token SET last_error = ?, attempted_at = ? WHERE id = 1", (error, now))
+        self.db.commit()
 
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +321,22 @@ class GraphClient:
     def publish(self, container_id: str) -> str:
         return self._request("POST", f"{self.cfg.ig_user_id}/media_publish", creation_id=container_id)["id"]
 
+    def refresh_token(self) -> tuple[str, int]:
+        """Verlängert einen Langzeit-Token (Instagram-Login) um 60 Tage. Gibt (Token, Sekunden) zurück."""
+        resp = self.session.get(
+            f"{self.cfg.graph_host}/refresh_access_token",
+            params={"grant_type": "ig_refresh_token", "access_token": self.cfg.access_token},
+            timeout=60,
+        )
+        try:
+            body = resp.json()
+        except ValueError:
+            raise GraphError(f"HTTP {resp.status_code}: {resp.text[:200]}") from None
+        if "error" in body or "access_token" not in body:
+            err = body.get("error", {})
+            raise GraphError(f"Token-Verlängerung fehlgeschlagen: {err.get('message', body)}")
+        return body["access_token"], int(body.get("expires_in", 60 * 86400))
+
 
 def media_params(url: str, video: bool) -> dict:
     return {"video_url": url} if video else {"image_url": url}
@@ -313,8 +375,47 @@ def publish_post(client: GraphClient, post: ScheduledPost, base_url: str) -> str
 # Befehle
 # --------------------------------------------------------------------------- #
 
+def describe(exc: Exception) -> str:
+    """Fehlertext ohne Zugriffstoken (requests nennt bei GET-Fehlern die komplette URL)."""
+    return re.sub(r"access_token=[^&\s'\")]+", "access_token=***", str(exc))
+
+
 def log(msg: str) -> None:
     print(f"{datetime.now().isoformat(timespec='seconds')} {msg}", flush=True)
+
+
+def ensure_token(cfg: Config, state: State, client: GraphClient, force: bool = False) -> None:
+    """Lädt den aktuellen Token und verlängert ihn, wenn die letzte Verlängerung lange genug her ist.
+
+    Instagram verlängert nur Tokens, die mindestens 24 Stunden alt und noch gültig sind.
+    Schlägt die Verlängerung fehl, wird mit dem bisherigen Token weitergearbeitet.
+    """
+    row = state.token(cfg.access_token)
+    cfg.access_token = row["access_token"]
+    now = datetime.now(timezone.utc)
+
+    if row["expires_at"]:
+        left = datetime.fromisoformat(row["expires_at"]) - now
+        if left < timedelta(days=7):
+            log(f"WARNUNG Zugriffstoken läuft in {max(left.days, 0)} Tag(en) ab.")
+
+    if "graph.instagram.com" not in cfg.graph_host:
+        return  # ig_refresh_token gibt es nur beim Instagram-Login
+    if not force:
+        if row["refreshed_at"] and now - datetime.fromisoformat(row["refreshed_at"]) < timedelta(days=cfg.token_refresh_days):
+            return
+        # Nach einem Fehlschlag (z. B. Token noch keine 24 h alt) höchstens einmal pro Stunde neu versuchen.
+        if row["attempted_at"] and now - datetime.fromisoformat(row["attempted_at"]) < timedelta(hours=1):
+            return
+    try:
+        token, expires_in = client.refresh_token()
+    except (GraphError, requests.RequestException) as exc:
+        state.token_error(describe(exc))
+        log(f"WARNUNG {describe(exc)}")
+        return
+    state.save_token(token, now + timedelta(seconds=expires_in))
+    cfg.access_token = token
+    log(f"Zugriffstoken verlängert, gültig bis {(now + timedelta(seconds=expires_in)).date()}.")
 
 
 def due_posts(posts: list[ScheduledPost], state: State, now: datetime, max_attempts: int) -> list[ScheduledPost]:
@@ -344,6 +445,8 @@ def cmd_run(cfg: Config, dry_run: bool = False, client: GraphClient | None = Non
                 log(f"WARNUNG {err}")
         state = State(cfg.state_db)
         client = client or GraphClient(cfg)
+        if not dry_run:
+            ensure_token(cfg, state, client)
         failures = 0
 
         for post in due_posts(posts, state, datetime.now(timezone.utc), cfg.max_attempts):
@@ -354,8 +457,8 @@ def cmd_run(cfg: Config, dry_run: bool = False, client: GraphClient | None = Non
                 media_id = publish_post(client, post, cfg.media_base_url)
             except (GraphError, requests.RequestException) as exc:
                 failures += 1
-                state.record(post, "failed", error=str(exc))
-                log(f"FEHLER {post.id}: {exc}")
+                state.record(post, "failed", error=describe(exc))
+                log(f"FEHLER {post.id}: {describe(exc)}")
             else:
                 state.record(post, "published", media_id=media_id)
                 log(f"OK {post.id} veröffentlicht (Media-ID {media_id})")
@@ -365,6 +468,11 @@ def cmd_run(cfg: Config, dry_run: bool = False, client: GraphClient | None = Non
 def cmd_list(cfg: Config) -> int:
     posts = read_schedule(cfg.schedule_file, cfg.timezone)
     state = State(cfg.state_db)
+    token = state.db.execute("SELECT * FROM token WHERE id = 1").fetchone()
+    if token and token["expires_at"]:
+        print(f"Zugriffstoken gültig bis {token['expires_at']}, zuletzt verlängert {token['refreshed_at']}")
+    if token and token["last_error"]:
+        print(f"Letzte Token-Verlängerung fehlgeschlagen: {token['last_error']}")
     print(f"{'ID':<20} {'Zeitpunkt':<17} {'Typ':<6} {'Dateien':>7}  Status")
     for post in sorted(posts, key=lambda p: p.publish_at):
         row = state.get(post.id)
@@ -403,6 +511,17 @@ def cmd_check(cfg: Config, session: requests.Session | None = None) -> int:
     return 1 if problems else 0
 
 
+def cmd_refresh_token(cfg: Config, client: GraphClient | None = None) -> int:
+    state = State(cfg.state_db)
+    ensure_token(cfg, state, client or GraphClient(cfg), force=True)
+    row = state.db.execute("SELECT * FROM token WHERE id = 1").fetchone()
+    if row["last_error"]:
+        print(f"Fehler: {row['last_error']}")
+        return 1
+    print(f"Token gültig bis {row['expires_at']}")
+    return 0
+
+
 def cmd_retry(cfg: Config, post_id: str) -> int:
     if State(cfg.state_db).reset(post_id):
         print(f"{post_id} wird beim nächsten Lauf erneut versucht.")
@@ -421,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("check", help="CSV und Medien-URLs prüfen")
     retry = sub.add_parser("retry", help="fehlgeschlagenen Beitrag erneut einplanen")
     retry.add_argument("id")
+    sub.add_parser("refresh-token", help="Zugriffstoken sofort verlängern")
     args = parser.parse_args(argv)
 
     load_dotenv(args.env)
@@ -432,6 +552,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_list(cfg)
     if args.command == "check":
         return cmd_check(cfg)
+    if args.command == "refresh-token":
+        return cmd_refresh_token(cfg)
     return cmd_retry(cfg, args.id)
 
 
