@@ -22,11 +22,12 @@ class FakeResponse:
 class FakeSession:
     """Simuliert die Graph API und merkt sich alle Aufrufe."""
 
-    def __init__(self, statuses=None, fail_on=None):
+    def __init__(self, statuses=None, fail_on=None, refresh=None):
         self.calls = []
         self.statuses = statuses or {}
         self.fail_on = fail_on
         self.counter = 0
+        self.refresh = refresh or {"access_token": "NEW", "token_type": "bearer", "expires_in": 5184000}
 
     def post(self, url, data, timeout):
         self.calls.append(("POST", url, dict(data)))
@@ -37,12 +38,17 @@ class FakeSession:
 
     def get(self, url, params, timeout):
         self.calls.append(("GET", url, dict(params)))
+        if url.endswith("/refresh_access_token"):
+            return FakeResponse(self.refresh)
         container = url.rsplit("/", 1)[1]
         seq = self.statuses.get(container, ["FINISHED"])
         return FakeResponse({"status_code": seq.pop(0) if len(seq) > 1 else seq[0]})
 
     def posts(self):
         return [c for c in self.calls if c[0] == "POST"]
+
+    def refreshes(self):
+        return [c for c in self.calls if c[1].endswith("/refresh_access_token")]
 
 
 @pytest.fixture
@@ -226,3 +232,95 @@ def test_dotenv_does_not_override_environment(tmp_path, monkeypatch):
     import os
     assert os.environ["IG_USER_ID"] == "999"
     assert os.environ["TIMEZONE"] == "UTC"
+
+
+# --- Token -------------------------------------------------------------------
+
+def test_run_refreshes_token_and_uses_it(cfg):
+    past = (datetime.now(TZ) - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
+    write_csv(cfg.schedule_file, [f"due,{past},post,a.jpg,"])
+    session = FakeSession()
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+
+    (refresh,) = session.refreshes()
+    assert refresh[1] == "https://graph.instagram.com/refresh_access_token"
+    assert refresh[2] == {"grant_type": "ig_refresh_token", "access_token": "TOKEN"}
+    assert all(c[2]["access_token"] == "NEW" for c in session.posts())
+
+    row = iu.State(cfg.state_db).db.execute("SELECT * FROM token").fetchone()
+    assert row["access_token"] == "NEW"
+    expires = datetime.fromisoformat(row["expires_at"]) - datetime.now(timezone.utc)
+    assert timedelta(days=59) < expires <= timedelta(days=60)
+    assert oct(cfg.state_db.stat().st_mode & 0o777) == "0o600"
+
+
+def test_token_is_not_refreshed_again_too_early(cfg):
+    write_csv(cfg.schedule_file, [])
+    session = FakeSession()
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+    cfg.access_token = "TOKEN"  # wie beim nächsten Start aus der .env
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+    assert len(session.refreshes()) == 1
+    assert cfg.access_token == "NEW"  # gespeicherter Token wird weiterverwendet
+
+
+def test_token_is_refreshed_after_interval(cfg):
+    write_csv(cfg.schedule_file, [])
+    session = FakeSession()
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+    state = iu.State(cfg.state_db)
+    old = (datetime.now(timezone.utc) - timedelta(days=cfg.token_refresh_days, minutes=1)).isoformat()
+    state.db.execute("UPDATE token SET refreshed_at = ?, attempted_at = ?", (old, old))
+    state.db.commit()
+
+    session.refresh = {"access_token": "NEWER", "expires_in": 5184000}
+    cfg.access_token = "TOKEN"
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+    assert len(session.refreshes()) == 2
+    assert session.refreshes()[1][2]["access_token"] == "NEW"
+    assert cfg.access_token == "NEWER"
+
+
+def test_failed_refresh_keeps_old_token_and_waits_an_hour(cfg):
+    past = (datetime.now(TZ) - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
+    write_csv(cfg.schedule_file, [f"due,{past},post,a.jpg,"])
+    session = FakeSession(refresh={"error": {"message": "token too new"}})
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+    assert all(c[2]["access_token"] == "TOKEN" for c in session.posts())
+    assert iu.State(cfg.state_db).get("due")["status"] == "published"
+
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+    assert len(session.refreshes()) == 1
+    row = iu.State(cfg.state_db).db.execute("SELECT * FROM token").fetchone()
+    assert "token too new" in row["last_error"]
+    assert row["access_token"] == "TOKEN"
+
+
+def test_new_token_in_env_replaces_stored_one(cfg):
+    write_csv(cfg.schedule_file, [])
+    session = FakeSession()
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+    cfg.access_token = "MANUAL"
+    session.refresh = {"access_token": "MANUAL2", "expires_in": 5184000}
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+    assert session.refreshes()[1][2]["access_token"] == "MANUAL"
+    assert cfg.access_token == "MANUAL2"
+
+
+def test_no_refresh_with_facebook_login(cfg):
+    cfg.graph_host = "https://graph.facebook.com"
+    write_csv(cfg.schedule_file, [])
+    session = FakeSession()
+    iu.cmd_run(cfg, client=client_for(cfg, session))
+    assert session.refreshes() == []
+
+
+def test_refresh_token_command(cfg, capsys):
+    assert iu.cmd_refresh_token(cfg, client=client_for(cfg, FakeSession())) == 0
+    assert "gültig bis" in capsys.readouterr().out
+
+
+def test_errors_do_not_leak_token():
+    exc = Exception("Max retries exceeded with url: /refresh_access_token?grant_type=x&access_token=IGAAsecret (Caused by")
+    assert "IGAAsecret" not in iu.describe(exc)
+    assert "access_token=***" in iu.describe(exc)
